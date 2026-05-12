@@ -1,0 +1,2 @@
+"""JongMind mahjong AI experiments."""
+
