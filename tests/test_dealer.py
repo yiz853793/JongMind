@@ -1,6 +1,10 @@
+import json
+import tempfile
 import unittest
 from queue import Empty, Queue
+from pathlib import Path
 
+from jongmind.action_space import DRAW_ACTION_ID, action_id_to_human_readable, human_readable_to_action_id
 from jongmind.dealer import DealerCommand, MahjongDealer, Phase, Seat
 from jongmind.game import Meld
 from jongmind.runtime import broadcast_dealer_result
@@ -42,6 +46,53 @@ class MahjongDealerTest(unittest.TestCase):
         self.assertEqual(views[Seat.EAST]["wall_count"], 69)
         self.assertEqual(views[Seat.EAST]["dead_wall_count"], 14)
         self.assertEqual(views[Seat.EAST]["dora"], [dora_from_indicator(dealer.state.dora_indicators[0])])
+
+    def test_player_state_includes_public_observation_and_action_mask(self) -> None:
+        dealer = MahjongDealer(seed=1)
+        views = dealer.start_hand()
+        east = views[Seat.EAST]
+        east_tile = dealer.state.hands[Seat.EAST][0]
+        discard_id = human_readable_to_action_id(f"discard_{east_tile}")
+
+        self.assertIn(discard_id, east["legal_action_ids"])
+        self.assertEqual(east["legal_action_mask"][discard_id], 1)
+        self.assertEqual(action_id_to_human_readable(discard_id), f"discard_{east_tile}")
+        self.assertIn("hand", east["obs_public"])
+        self.assertIn("discards", east["obs_public"])
+        self.assertNotIn("live_wall", east["obs_public"])
+        self.assertNotIn("dead_wall", east["obs_public"])
+        self.assertNotIn("ura_dora_indicators", east["obs_public"])
+
+        for seat in (Seat.SOUTH, Seat.WEST, Seat.NORTH):
+            dealer.state.hands[seat] = []
+        dealer.discard(Seat.EAST, east_tile)
+        south = dealer.get_state(Seat.SOUTH)
+
+        self.assertIn(DRAW_ACTION_ID, south["legal_action_ids"])
+        self.assertEqual(south["legal_action_mask"][DRAW_ACTION_ID], 1)
+
+    def test_hand_history_log_records_replay_decision_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "hands.jsonl"
+            dealer = MahjongDealer(seed=2, hand_log_path=log_path)
+            dealer.start_hand()
+
+            tile = dealer.state.hands[Seat.EAST][0]
+            dealer.discard(Seat.EAST, tile)
+            dealer.close_hand_log(reason="test")
+
+            records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertFalse(record["completed"])
+        self.assertEqual(record["close_reason"], "test")
+        command_events = [event for event in record["events"] if event["type"] == "command"]
+        self.assertEqual(command_events[0]["action_text"], f"discard_{tile}")
+        self.assertIn(command_events[0]["action"], command_events[0]["legal_actions"])
+        self.assertEqual(command_events[0]["obs_public"]["phase"], "discard")
+        self.assertNotIn("live_wall", command_events[0]["obs_public"])
+        self.assertIn("live_wall", command_events[0]["hidden_state_for_review_only"])
 
     def test_start_hand_deals_current_east_wind_player_14_and_first_discard_is_tedashi(self) -> None:
         dealer = MahjongDealer(seed=19)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from multiprocessing import Queue
+from pathlib import Path
 from queue import Empty
 from typing import Any
 
@@ -14,53 +15,57 @@ def dealer_process(
     response_queues: dict[Seat, Queue],
     seed: int | None = None,
     poll_timeout: float = 0.2,
+    hand_log_path: str | Path | None = None,
 ) -> None:
     """Run a dealer event loop in its own process."""
     from jongmind.dealer import MahjongDealer
 
-    dealer = MahjongDealer(seed=seed)
+    dealer = MahjongDealer(seed=seed, hand_log_path=hand_log_path)
 
-    while True:
-        try:
-            command: DealerCommand = command_queue.get(timeout=poll_timeout)
-        except Empty:
-            continue
+    try:
+        while True:
+            try:
+                command: DealerCommand = command_queue.get(timeout=poll_timeout)
+            except Empty:
+                continue
 
-        target = command.seat
-        try:
-            result = dealer.handle(command)
-            if command.kind == "start":
-                assert isinstance(result, dict)
-                for seat, queue in response_queues.items():
-                    queue.put({"ok": True, **result[seat]})
-            elif command.kind in {
-                "draw",
-                "discard",
-                "pass",
-                "call",
-                "win",
-                "closed_kan",
-                "added_kan",
-                "abortive_draw",
-                "stop",
-            }:
-                assert isinstance(result, dict)
-                broadcast_dealer_result(command, result, dealer, response_queues)
-            elif target is None:
-                for queue in response_queues.values():
-                    queue.put({"ok": True, **result})
-            else:
-                response_queues[target].put({"ok": True, **result})
-        except Exception as exc:  # pragma: no cover - process boundary reporting
-            error = {"ok": False, "error": str(exc), "command": command.kind}
-            if target is None:
-                for queue in response_queues.values():
-                    queue.put(error)
-            else:
-                response_queues[target].put(error)
+            target = command.seat
+            try:
+                result = dealer.handle(command)
+                if command.kind == "start":
+                    assert isinstance(result, dict)
+                    for seat, queue in response_queues.items():
+                        queue.put({"ok": True, **result[seat]})
+                elif command.kind in {
+                    "draw",
+                    "discard",
+                    "pass",
+                    "call",
+                    "win",
+                    "closed_kan",
+                    "added_kan",
+                    "abortive_draw",
+                    "stop",
+                }:
+                    assert isinstance(result, dict)
+                    broadcast_dealer_result(command, result, dealer, response_queues)
+                elif target is None:
+                    for queue in response_queues.values():
+                        queue.put({"ok": True, **result})
+                else:
+                    response_queues[target].put({"ok": True, **result})
+            except Exception as exc:  # pragma: no cover - process boundary reporting
+                error = {"ok": False, "error": str(exc), "command": command.kind}
+                if target is None:
+                    for queue in response_queues.values():
+                        queue.put(error)
+                else:
+                    response_queues[target].put(error)
 
-        if command.kind == "stop":
-            break
+            if command.kind == "stop":
+                break
+    finally:
+        dealer.close_hand_log(reason="process_exit")
 
 
 def broadcast_dealer_result(

@@ -141,6 +141,11 @@ def main() -> None:
         help="Target seat for every match, rotate deterministically, or randomize at match start.",
     )
     parser.add_argument("--output-dir", default="outputs/eval")
+    parser.add_argument(
+        "--hand-log",
+        default="",
+        help="Optional JSONL hand history path. Use 'auto' to write hands.jsonl in the eval run dir.",
+    )
     parser.add_argument("--max-steps-per-hand", type=int, default=2000)
     args = parser.parse_args()
     args.seed = _resolve_seed(args.seed)
@@ -150,6 +155,7 @@ def main() -> None:
     target_player, opponent_players = _build_player_specs(args.target, opponents)
     run_dir = Path(args.output_dir) / f"eval_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    hand_log_path = _hand_log_path(args.hand_log, run_dir)
 
     records: list[MatchRecord] = []
     totals: dict[str, EvalTotals] = {
@@ -167,6 +173,7 @@ def main() -> None:
             target_seat=target_seat,
             lineup=lineup,
             max_steps_per_hand=args.max_steps_per_hand,
+            hand_log_path=hand_log_path,
         )
         records.append(record)
         _accumulate(totals, record)
@@ -181,6 +188,7 @@ def main() -> None:
         "seed": args.seed,
         "target_seat": args.target_seat,
         "output_dir": str(run_dir),
+        "hand_log": str(hand_log_path) if hand_log_path is not None else None,
         "errors": sum(player_summary["errors"] for player_summary in player_summaries.values()),
         "zero_win_matches": sum(1 for record in records if _record_total_wins(record) == 0),
         "zero_win_match_rate": (
@@ -201,8 +209,27 @@ def run_match(
     target_seat: Seat,
     lineup: dict[Seat, PlayerSpec],
     max_steps_per_hand: int = 2000,
+    hand_log_path: Path | None = None,
 ) -> MatchRecord:
-    dealer = MahjongDealer(seed=seed)
+    dealer = MahjongDealer(
+        seed=seed,
+        hand_log_path=hand_log_path,
+        record_context={
+            "match_index": match_index,
+            "match_type": match_type,
+            "target_seat": target_seat.name,
+            "lineup": {
+                seat.name: {
+                    "player": player.name,
+                    "model": player.model,
+                    "is_target": player.is_target,
+                }
+                for seat, player in lineup.items()
+            },
+        }
+        if hand_log_path is not None
+        else None,
+    )
     scores = {seat: dealer.rules.starting_points for seat in Seat}
     agents: dict[Seat, DiscardAgent] = {
         seat: create_model(player.model, seed=seed * 100 + int(seat))
@@ -523,6 +550,15 @@ def _lineup(
     return lineup
 
 
+def _hand_log_path(raw: str, run_dir: Path) -> Path | None:
+    value = raw.strip()
+    if not value:
+        return None
+    if value.lower() == "auto":
+        return run_dir / "hands.jsonl"
+    return Path(value)
+
+
 def _accumulate(totals: dict[str, EvalTotals], record: MatchRecord) -> None:
     total_wins = _record_total_wins(record)
     for player_name, player_record in record.players.items():
@@ -720,6 +756,8 @@ def _display_width(value: str) -> int:
 def _print_summary(summary: dict[str, Any]) -> None:
     print("\n=== evaluation summary ===")
     print(f"输出目录     {summary['output_dir']}")
+    if summary.get("hand_log"):
+        print(f"hand_log      {summary['hand_log']}")
     for player_name, player_summary in summary["players"].items():
         print(f"\n--- {player_name} ({player_summary['model']}) ---")
         print(f"总对局数     {player_summary['matches']}")

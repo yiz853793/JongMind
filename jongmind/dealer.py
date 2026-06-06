@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from itertools import combinations
 from multiprocessing import Queue
+from pathlib import Path
 from random import Random
-from typing import Any
+from typing import Any, Mapping
 
+from jongmind.action_space import legal_action_ids, legal_action_mask, legal_action_specs, public_observation
 from jongmind.game import DealerCommand, DealerState, Meld, PendingReaction, Phase, Seat
+from jongmind.recording import HandHistoryRecorder
 from jongmind.rules import MAHJONG_SOUL_4P_RANKED, RuleSet
 from jongmind.scoring import HandValue, MahjongSoulScoring, WinContext
 from jongmind.tiles import (
@@ -25,11 +28,23 @@ from jongmind.tiles import (
 class MahjongDealer:
     """Owns one Mahjong Soul style hand and handles dealer commands."""
 
-    def __init__(self, seed: int | None = None, rules: RuleSet = MAHJONG_SOUL_4P_RANKED) -> None:
+    def __init__(
+        self,
+        seed: int | None = None,
+        rules: RuleSet = MAHJONG_SOUL_4P_RANKED,
+        hand_log_path: str | Path | None = None,
+        record_context: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.seed = seed
         self.random = Random(seed)
         self.rules = rules
         self.scoring = MahjongSoulScoring(rules)
         self.state = DealerState(scores={seat: rules.starting_points for seat in Seat})
+        self.hand_recorder = (
+            HandHistoryRecorder(hand_log_path, seed=seed, context=record_context)
+            if hand_log_path is not None
+            else None
+        )
 
     def start_hand(self) -> dict[Seat, dict[str, Any]]:
         hand_number = self.state.hand_number
@@ -68,16 +83,22 @@ class MahjongDealer:
             honba=honba,
             riichi_sticks=riichi_sticks,
         )
-        return {seat: self.get_state(seat) for seat in Seat}
+        views = {seat: self.get_state(seat) for seat in Seat}
+        self._record_start_hand(views)
+        return views
 
     def draw(self, seat: Seat) -> dict[str, Any]:
         self._require_active_turn(seat, Phase.DRAW)
+        command = DealerCommand(kind="draw", seat=seat)
+        before_view = self.get_state(seat)
         if not self.state.live_wall:
-            return self._finish_exhaustive_draw()
+            result = self._finish_exhaustive_draw()
+            return self._record_command_result(command, result, before_view=before_view)
 
         tile = self.state.live_wall.pop()
         self._add_drawn_tile(seat, tile, rinshan=False)
-        return {"event": "draw", "actor": seat.name, "tile": tile, **self.get_state(seat)}
+        result = {"event": "draw", "actor": seat.name, "tile": tile, **self.get_state(seat)}
+        return self._record_command_result(command, result, before_view=before_view)
 
     def discard(self, seat: Seat, tile: str, riichi: bool = False) -> dict[str, Any]:
         self._require_active_turn(seat, Phase.DISCARD)
@@ -88,10 +109,12 @@ class MahjongDealer:
             if tile != forced_tile:
                 raise ValueError(f"{seat.name} has declared riichi and must discard the drawn tile")
 
+        before_view = self.get_state(seat)
         if riichi:
             self._validate_riichi_discard(seat, tile)
             self.state.pending_riichi_seat = seat
 
+        command = DealerCommand(kind="discard", seat=seat, tile=tile, riichi=riichi)
         was_ippatsu = self.state.ippatsu_active[seat]
         self.state.hands[seat].remove(tile)
         self.state.discards[seat].append(tile)
@@ -108,20 +131,28 @@ class MahjongDealer:
         if pending_reaction is not None:
             self.state.pending_reaction = pending_reaction
             self.state.phase = Phase.REACTION
-            return {
+            result = {
                 "event": "discard_reaction",
                 "actor": seat.name,
                 "tile": tile,
                 "discard_type": "tsumogiri" if from_draw else "tedashi",
                 **self.get_state(seat),
             }
+            return self._record_command_result(command, result, before_view=before_view)
 
-        return self._finish_discard_without_call(seat, tile, from_draw=from_draw)
+        result = self._finish_discard_without_call(seat, tile, from_draw=from_draw)
+        return self._record_command_result(command, result, before_view=before_view)
 
     def pass_reaction(self, seat: Seat) -> dict[str, Any]:
         pending = self._require_pending_reaction(seat)
+        before_view = self.get_state(seat)
         pending.responses[seat] = DealerCommand(kind="pass", seat=seat)
-        return self._resolve_reaction_if_ready()
+        result = self._resolve_reaction_if_ready()
+        return self._record_command_result(
+            DealerCommand(kind="pass", seat=seat),
+            result,
+            before_view=before_view,
+        )
 
     def call(self, seat: Seat, action: str, tiles: tuple[str, ...]) -> dict[str, Any]:
         pending = self._require_pending_reaction(seat)
@@ -129,6 +160,7 @@ class MahjongDealer:
             raise ValueError(f"{seat.name} cannot call {action}")
         if action == "ron":
             raise ValueError("use win command for ron")
+        before_view = self.get_state(seat)
         self._validate_call_tiles(seat, action, tiles, pending.tile, pending.discarder)
         pending.responses[seat] = DealerCommand(
             kind="call",
@@ -136,17 +168,25 @@ class MahjongDealer:
             action=action,
             tiles=tiles,
         )
-        return self._resolve_reaction_if_ready()
+        result = self._resolve_reaction_if_ready()
+        command = DealerCommand(kind="call", seat=seat, action=action, tiles=tiles)
+        return self._record_command_result(command, result, before_view=before_view)
 
     def win(self, seat: Seat, action: str | None = None) -> dict[str, Any]:
         if self.state.phase == Phase.DISCARD and seat == self.state.current_turn:
-            return self._apply_tsumo(seat)
+            before_view = self.get_state(seat)
+            result = self._apply_tsumo(seat)
+            command = DealerCommand(kind="win", seat=seat, action=action or "tsumo")
+            return self._record_command_result(command, result, before_view=before_view)
         if self.state.phase == Phase.REACTION:
             pending = self._require_pending_reaction(seat)
             if "ron" not in pending.options[seat]:
                 raise ValueError(f"{seat.name} cannot ron")
+            before_view = self.get_state(seat)
             pending.responses[seat] = DealerCommand(kind="win", seat=seat, action="ron")
-            return self._resolve_reaction_if_ready()
+            result = self._resolve_reaction_if_ready()
+            command = DealerCommand(kind="win", seat=seat, action="ron")
+            return self._record_command_result(command, result, before_view=before_view)
         raise RuntimeError("win is not legal in the current phase")
 
     def declare_closed_kan(self, seat: Seat, tiles: tuple[str, ...]) -> dict[str, Any]:
@@ -156,33 +196,46 @@ class MahjongDealer:
         self._require_tiles_in_hand(seat, tiles)
         if len({normalize_tile(tile) for tile in tiles}) != 1:
             raise ValueError("closed kan tiles must all match")
-        return self._apply_own_kan(seat, "closed_kan", tiles, open_meld=False)
+        before_view = self.get_state(seat)
+        result = self._apply_own_kan(seat, "closed_kan", tiles, open_meld=False)
+        command = DealerCommand(kind="closed_kan", seat=seat, tiles=tiles)
+        return self._record_command_result(command, result, before_view=before_view)
 
     def declare_added_kan(self, seat: Seat, tile: str) -> dict[str, Any]:
         self._require_active_turn(seat, Phase.DISCARD)
         if tile not in self.state.hands[seat]:
             raise ValueError(f"{seat.name} cannot add kan with {tile}: tile is not in hand")
         self._find_added_kan_meld_index(seat, tile)
+        command = DealerCommand(kind="added_kan", seat=seat, tile=tile)
+        before_view = self.get_state(seat)
 
         pending_reaction = self._build_chankan_reaction(seat, tile)
         if pending_reaction is not None:
             self.state.pending_reaction = pending_reaction
             self.state.phase = Phase.REACTION
-            return {
+            result = {
                 "event": "added_kan_reaction",
                 "actor": seat.name,
                 "tile": tile,
                 "kan_tile": normalize_tile(tile),
                 **self.get_state(seat),
             }
+            return self._record_command_result(command, result, before_view=before_view)
 
-        return self._complete_added_kan(seat, tile)
+        result = self._complete_added_kan(seat, tile)
+        return self._record_command_result(command, result, before_view=before_view)
 
     def abortive_draw(self, seat: Seat) -> dict[str, Any]:
         self._require_active_turn(seat, Phase.DISCARD)
         if not self._can_kyuushu_kyuuhai(seat):
             raise ValueError(f"{seat.name} cannot declare kyuushu kyuuhai")
-        return self._finish_draw("kyuushu_kyuuhai")
+        before_view = self.get_state(seat)
+        result = self._finish_draw("kyuushu_kyuuhai")
+        return self._record_command_result(
+            DealerCommand(kind="abortive_draw", seat=seat),
+            result,
+            before_view=before_view,
+        )
 
     def get_state(self, seat: Seat | None = None) -> dict[str, Any]:
         view = self.state.public_view(seat)
@@ -221,6 +274,10 @@ class MahjongDealer:
             action_hints = self._reaction_action_hints(seat)
         view["legal_actions"] = sorted(set(legal_actions), key=legal_actions.index)
         view["action_hints"] = action_hints
+        view["legal_action_ids"] = legal_action_ids(view)
+        view["legal_action_mask"] = legal_action_mask(view)
+        view["legal_action_specs"] = [spec.public_view() for spec in legal_action_specs(view)]
+        view["obs_public"] = public_observation(view)
         return view
 
     def handle(self, command: DealerCommand) -> dict[str, Any] | dict[Seat, dict[str, Any]]:
@@ -261,9 +318,29 @@ class MahjongDealer:
                 raise ValueError("abortive_draw requires a seat")
             return self.abortive_draw(command.seat)
         if command.kind == "stop":
+            before_view = self.get_state(command.seat) if command.seat is not None else self.get_state()
             self.state.phase = Phase.FINISHED
-            return {"event": "stopped", **self.get_state(command.seat)}
+            result = {"event": "stopped", **self.get_state(command.seat)}
+            return self._record_command_result(command, result, before_view=before_view)
         raise ValueError(f"unknown command: {command.kind}")
+
+    def close_hand_log(self, reason: str = "closed") -> None:
+        if self.hand_recorder is not None:
+            self.hand_recorder.close(self.state, reason=reason)
+
+    def _record_start_hand(self, views: Mapping[Seat, dict[str, Any]]) -> None:
+        if self.hand_recorder is not None:
+            self.hand_recorder.start_hand(self.state, self.rules, views)
+
+    def _record_command_result(
+        self,
+        command: DealerCommand,
+        result: dict[str, Any],
+        before_view: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if self.hand_recorder is not None:
+            self.hand_recorder.record_command(command, result, self.state, before_view=before_view)
+        return result
 
     def _require_active_turn(self, seat: Seat, phase: Phase) -> None:
         if self.state.phase == Phase.FINISHED:
@@ -796,6 +873,8 @@ class MahjongDealer:
             return []
         if self.state.scores[seat] < 1000:
             return []
+        if len(self.state.hands[seat]) not in {2, 5, 8, 11, 14}:
+            return []
 
         candidates: list[str] = []
         seen: set[str] = set()
@@ -805,7 +884,11 @@ class MahjongDealer:
             seen.add(tile)
             remaining = self.state.hands[seat][:]
             remaining.remove(tile)
-            if self.scoring.is_tenpai(remaining):
+            try:
+                is_tenpai = self.scoring.is_tenpai(remaining)
+            except ValueError:
+                is_tenpai = False
+            if is_tenpai:
                 candidates.append(tile)
         return sort_tiles(candidates)
 
@@ -996,6 +1079,7 @@ def dealer_process(
     response_queues: dict[Seat, Queue],
     seed: int | None = None,
     poll_timeout: float = 0.2,
+    hand_log_path: str | Path | None = None,
 ) -> None:
     """Compatibility wrapper for ``jongmind.runtime.dealer_process``."""
     from jongmind.runtime import dealer_process as run_dealer_process
@@ -1005,4 +1089,5 @@ def dealer_process(
         response_queues=response_queues,
         seed=seed,
         poll_timeout=poll_timeout,
+        hand_log_path=hand_log_path,
     )
